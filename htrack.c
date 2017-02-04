@@ -1,9 +1,9 @@
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
 #include <errno.h>
 #include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #include <sys/socket.h>
 
@@ -14,17 +14,15 @@
 
 struct {
     struct sockaddr_storage addr;
-    int timeout;
-    int retry;
     int port;
+    int oneshot;
+    int timeout;
     int count;
     int idle;
     int interval;
-    int oneshot;
 } ht = {
-    .timeout = 5000,
-    .retry = 3,
     .port = 80,
+    .timeout = 5000,
 };
 
 static int
@@ -174,9 +172,11 @@ ht_init(int argc, char **argv)
     } opts[] = {
         {"host", ht_opt_host, &ht.addr},
         {"port", ht_opt_ushort, &ht.port},
-        {"timeout", ht_opt_int, &ht.timeout},
-        {"retry", ht_opt_int, &ht.retry},
+        {"timeout", ht_opt_flag, &ht.timeout},
         {"oneshot", ht_opt_flag, &ht.oneshot},
+        {"count", ht_opt_int, &ht.count},
+        {"idle", ht_opt_int, &ht.idle},
+        {"interval", ht_opt_int, &ht.interval},
     };
 
     for (int i = 0; i < sizeof(opts) / sizeof(opts[0]); i++) {
@@ -270,7 +270,14 @@ main(int argc, char **argv)
     if (ht.oneshot)
         return 0;
 
-    pollfd.events = 0;
+    pollfd.events = POLLIN;
+
+    char *buf = malloc(4096);
+
+    if (!buf) {
+        perror("malloc");
+        return 1;
+    }
 
     while (1) {
         ret = poll(&pollfd, 1, -1);
@@ -280,9 +287,16 @@ main(int argc, char **argv)
             return 1;
         }
 
-        if (pollfd.revents & POLLHUP) {
-            fprintf(stderr, "pollhup");
-            return 0;
+        if (pollfd.revents & POLLIN) {
+            int r = read(pollfd.fd, buf, 4096);
+
+            if (r == -1) {
+                perror("read");
+                return 1;
+            }
+
+            if (!r)
+                return 0;
         }
     }
 
