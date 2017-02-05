@@ -13,14 +13,14 @@
 #include <arpa/inet.h>
 
 struct {
-    struct sockaddr_storage addr;
+    struct sockaddr_storage remote, local;
     int port;
     int count;
     int timeout;
     struct {
         char *data;
         int size;
-    } buf;
+    } req, buf;
 } ht = {
     .port = 80,
     .count = 3,
@@ -29,6 +29,17 @@ struct {
         .size = 4096,
     },
 };
+
+static int
+ht_opt_str(int argc, char **argv, void *data)
+{
+    if (argc <= 1)
+        return 1;
+
+    memcpy(data, argv + 1, sizeof(char *));
+
+    return 0;
+}
 
 static int
 ht_opt_ushort(int argc, char **argv, void *data)
@@ -71,7 +82,7 @@ ht_opt_nat(int argc, char **argv, void *data)
 }
 
 static int
-ht_opt_host(int argc, char **argv, void *data)
+ht_opt_addr(int argc, char **argv, void *data)
 {
     if (argc <= 1)
         return 1;
@@ -149,8 +160,10 @@ ht_init(int argc, char **argv)
         int (*f)(int, char **, void *);
         void *data;
     } opts[] = {
-        {"host", ht_opt_host, &ht.addr},
+        {"host", ht_opt_addr, &ht.remote},
         {"port", ht_opt_ushort, &ht.port},
+        {"bind", ht_opt_addr, &ht.local},
+        {"send", ht_opt_str, &ht.req.data},
         {"timeout", ht_opt_nat, &ht.timeout},
         {"count", ht_opt_nat, &ht.count},
         {"bufsize", ht_opt_nat, &ht.buf.size},
@@ -165,17 +178,23 @@ ht_init(int argc, char **argv)
 
     in_port_t port = htons(ht.port);
 
-    switch (ht.addr.ss_family) {
+    switch (ht.remote.ss_family) {
     case AF_INET:
-        memcpy(&((struct sockaddr_in *)&ht.addr)->sin_port,
+        memcpy(&((struct sockaddr_in *)&ht.remote)->sin_port,
                &port, sizeof(port));
         break;
     case AF_INET6:
-        memcpy(&((struct sockaddr_in6 *)&ht.addr)->sin6_port,
+        memcpy(&((struct sockaddr_in6 *)&ht.remote)->sin6_port,
                &port, sizeof(port));
         break;
     default:
         fprintf(stderr, "option `host' is mandatory\n");
+        return 1;
+    }
+
+    if (ht.local.ss_family &&
+        ht.local.ss_family != ht.remote.ss_family) {
+        fprintf(stderr, "host and bind are not compatible\n");
         return 1;
     }
 
@@ -186,13 +205,61 @@ ht_init(int argc, char **argv)
         return 1;
     }
 
+    if (ht.req.data)
+        ht.req.size = strlen(ht.req.data);
+
     return 0;
 }
 
 static int
-ht_run(int fd)
+ht_send(int fd, char *data, int size)
 {
-    int ret = connect(fd, (struct sockaddr *)&ht.addr, sizeof(ht.addr));
+    int sent = 0;
+
+    while (sent < size) {
+        int r = send(fd, data + sent, size - sent, 0);
+
+        if (r == -1) {
+            if (errno == EAGAIN)
+                continue;
+
+            perror("send");
+            return 1;
+        }
+
+        sent += r;
+    }
+
+    return 0;
+}
+
+static int
+ht_addrlen(struct sockaddr_storage *ss)
+{
+    return (ss->ss_family == AF_INET) ? sizeof(struct sockaddr_in)
+                                      : sizeof(struct sockaddr_in6);
+}
+
+static int
+ht_bind(int fd)
+{
+    if (!ht.local.ss_family)
+        return 0;
+
+    int ret = bind(fd, (struct sockaddr *)&ht.local, ht_addrlen(&ht.local));
+
+    if (ret == -1) {
+        perror("bind");
+        return 1;
+    }
+
+    return 0;
+}
+
+static int
+ht_connect(int fd)
+{
+    int ret = connect(fd, (struct sockaddr *)&ht.remote, ht_addrlen(&ht.remote));
 
     if (ret == -1 && errno != EINPROGRESS) {
         perror("connect");
@@ -231,10 +298,19 @@ ht_run(int fd)
         return 1;
     }
 
-    pollfd.events = POLLIN;
+    return 0;
+}
+
+static int
+ht_wait(int fd)
+{
+    struct pollfd pollfd = {
+        .fd = fd,
+        .events = POLLIN,
+    };
 
     while (1) {
-        ret = poll(&pollfd, 1, -1);
+        int ret = poll(&pollfd, 1, -1);
 
         if (ret == -1) {
             perror("poll");
@@ -260,7 +336,7 @@ ht_run(int fd)
 static int
 ht_socket(void)
 {
-    int fd = socket(ht.addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
+    int fd = socket(ht.remote.ss_family, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
 
     if (fd == -1) {
         perror("socket");
@@ -288,7 +364,10 @@ main(int argc, char **argv)
         if (fd < 0)
             return 1;
 
-        if (ht_run(fd))
+        if (ht_bind(fd) ||
+            ht_connect(fd) ||
+            ht_send(fd, ht.req.data, ht.req.size) ||
+            ht_wait(fd))
             break;
 
         if (fd >= 0)
