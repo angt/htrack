@@ -15,25 +15,20 @@
 struct {
     struct sockaddr_storage addr;
     int port;
-    int oneshot;
-    int timeout;
     int count;
-    int idle;
-    int interval;
+    int timeout;
+    struct {
+        char *data;
+        int size;
+    } buf;
 } ht = {
     .port = 80,
-    .timeout = 5000,
+    .count = 3,
+    .timeout = 1,
+    .buf = {
+        .size = 4096,
+    },
 };
-
-static int
-ht_opt_flag(int argc, char **argv, void *data)
-{
-    int res = 1;
-
-    memcpy(data, &res, sizeof(res));
-
-    return 0;
-}
 
 static int
 ht_opt_ushort(int argc, char **argv, void *data)
@@ -56,7 +51,7 @@ ht_opt_ushort(int argc, char **argv, void *data)
 }
 
 static int
-ht_opt_int(int argc, char **argv, void *data)
+ht_opt_nat(int argc, char **argv, void *data)
 {
     if (argc <= 1)
         return 1;
@@ -67,7 +62,7 @@ ht_opt_int(int argc, char **argv, void *data)
     long val = strtol(argv[1], &end, 0);
     int res = val;
 
-    if (errno || argv[1] == end || val != (long)res)
+    if (errno || argv[1] == end || val < 0 || val != (long)res)
         return 1;
 
     memcpy(data, &res, sizeof(res));
@@ -102,19 +97,6 @@ ht_opt_host(int argc, char **argv, void *data)
     return -1;
 }
 
-/*
-static int
-ht_opt_str(int argc, char **argv, void *data)
-{
-    if (argc <= 1)
-        return 1;
-
-    memcpy(data, argv + 1, sizeof(char *));
-
-    return 0;
-}
-*/
-
 static int
 ht_opt(int argc, char **argv, char *name,
        int (*f)(int, char **, void *), void *data)
@@ -142,12 +124,9 @@ ht_keepalive(int fd)
         ht_sso(fd, IPPROTO_TCP, TCP_KEEPCNT, ht.count))
         return 1;
 
-    if (ht.idle > 0 &&
-        ht_sso(fd, IPPROTO_TCP, TCP_KEEPIDLE, ht.idle))
-        return 1;
-
-    if (ht.interval > 0 &&
-        ht_sso(fd, IPPROTO_TCP, TCP_KEEPINTVL, ht.interval))
+    if (ht.timeout > 0 &&
+        (ht_sso(fd, IPPROTO_TCP, TCP_KEEPIDLE, ht.timeout) ||
+         ht_sso(fd, IPPROTO_TCP, TCP_KEEPINTVL, ht.timeout)))
         return 1;
 
     return 0;
@@ -172,82 +151,67 @@ ht_init(int argc, char **argv)
     } opts[] = {
         {"host", ht_opt_host, &ht.addr},
         {"port", ht_opt_ushort, &ht.port},
-        {"timeout", ht_opt_flag, &ht.timeout},
-        {"oneshot", ht_opt_flag, &ht.oneshot},
-        {"count", ht_opt_int, &ht.count},
-        {"idle", ht_opt_int, &ht.idle},
-        {"interval", ht_opt_int, &ht.interval},
+        {"timeout", ht_opt_nat, &ht.timeout},
+        {"count", ht_opt_nat, &ht.count},
+        {"bufsize", ht_opt_nat, &ht.buf.size},
     };
 
     for (int i = 0; i < sizeof(opts) / sizeof(opts[0]); i++) {
         if (ht_opt(argc, argv, opts[i].name, opts[i].f, opts[i].data)) {
-            fprintf(stderr, "error: couldn't extract value for option `%s'\n", opts[i].name);
+            fprintf(stderr, "bad value for option `%s'\n", opts[i].name);
             return 1;
         }
     }
 
+    in_port_t port = htons(ht.port);
+
     switch (ht.addr.ss_family) {
     case AF_INET:
-        ((struct sockaddr_in *)&ht.addr)->sin_port = htons(ht.port);
+        memcpy(&((struct sockaddr_in *)&ht.addr)->sin_port,
+               &port, sizeof(port));
         break;
     case AF_INET6:
-        ((struct sockaddr_in6 *)&ht.addr)->sin6_port = htons(ht.port);
+        memcpy(&((struct sockaddr_in6 *)&ht.addr)->sin6_port,
+               &port, sizeof(port));
         break;
     default:
-        fprintf(stderr, "the option `host` is mandatory\n");
+        fprintf(stderr, "option `host' is mandatory\n");
+        return 1;
+    }
+
+    ht.buf.data = malloc(ht.buf.size);
+
+    if (!ht.buf.data) {
+        perror("malloc");
         return 1;
     }
 
     return 0;
 }
 
-int
-main(int argc, char **argv)
+static int
+ht_run(int fd)
 {
-    if (ht_init(argc, argv))
-        return 1;
-
-    struct pollfd pollfd = {
-        .fd = socket(ht.addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK, 0),
-        .events = POLLOUT,
-    };
-
-    if (pollfd.fd == -1) {
-        perror("socket");
-        return 1;
-    }
-
-    if (ht_keepalive(pollfd.fd))
-        fprintf(stderr, "couldn't setup keepalive\n");
-
-    if (ht_fastopen(pollfd.fd))
-        fprintf(stderr, "couldn't setup fastopen\n");
-
-    int ret = connect(pollfd.fd, (struct sockaddr *)&ht.addr, sizeof(ht.addr));
-
-    if (ret == 0)
-        return 0;
+    int ret = connect(fd, (struct sockaddr *)&ht.addr, sizeof(ht.addr));
 
     if (ret == -1 && errno != EINPROGRESS) {
         perror("connect");
         return 1;
     }
 
-    ret = poll(&pollfd, 1, ht.timeout);
+    struct pollfd pollfd = {
+        .fd = fd,
+        .events = POLLOUT,
+    };
 
-    if (ret == 0) {
-        ret = -1;
+    ret = poll(&pollfd, 1, ht.timeout * 1000);
+
+    if (ret == 0)
         errno = ETIMEDOUT;
-    }
 
-    if (ret == -1) {
+    if (ret <= 0) {
         perror("poll");
         return 1;
-    }
-
-    if (pollfd.revents & POLLHUP) {
-        fprintf(stderr, "pollhup");
-        return 0;
     }
 
     if (!(pollfd.revents & POLLOUT))
@@ -256,7 +220,7 @@ main(int argc, char **argv)
     ret = 0;
     socklen_t retlen = sizeof(ret);
 
-    if (getsockopt(pollfd.fd, SOL_SOCKET, SO_ERROR, &ret, &retlen) == -1) {
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &ret, &retlen) == -1) {
         perror("getsockopt");
         return 1;
     }
@@ -267,17 +231,7 @@ main(int argc, char **argv)
         return 1;
     }
 
-    if (ht.oneshot)
-        return 0;
-
     pollfd.events = POLLIN;
-
-    char *buf = malloc(4096);
-
-    if (!buf) {
-        perror("malloc");
-        return 1;
-    }
 
     while (1) {
         ret = poll(&pollfd, 1, -1);
@@ -288,7 +242,7 @@ main(int argc, char **argv)
         }
 
         if (pollfd.revents & POLLIN) {
-            int r = read(pollfd.fd, buf, 4096);
+            int r = read(fd, ht.buf.data, ht.buf.size);
 
             if (r == -1) {
                 perror("read");
@@ -296,9 +250,52 @@ main(int argc, char **argv)
             }
 
             if (!r)
-                return 0;
+                break;
         }
     }
 
-    return 1;
+    return 0;
+}
+
+static int
+ht_socket(void)
+{
+    int fd = socket(ht.addr.ss_family, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
+
+    if (fd == -1) {
+        perror("socket");
+        return -1;
+    }
+
+    if (ht_keepalive(fd))
+        fprintf(stderr, "couldn't setup keepalive\n");
+
+    if (ht_fastopen(fd))
+        fprintf(stderr, "couldn't setup fastopen\n");
+
+    return fd;
+}
+
+int
+main(int argc, char **argv)
+{
+    if (ht_init(argc, argv))
+        return 1;
+
+    while (1) {
+        int fd = ht_socket();
+
+        if (fd < 0)
+            return 1;
+
+        if (ht_run(fd))
+            break;
+
+        if (fd >= 0)
+            close(fd);
+
+        sleep(ht.timeout);
+    }
+
+    return 0;
 }
