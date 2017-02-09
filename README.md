@@ -1,3 +1,3 @@
 # htrack
 
-Not even tested yet :D
+An active Low-cost TCP tracker based on KA and TFO.
