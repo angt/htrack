@@ -28,7 +28,7 @@ struct {
 } ht = {
     .port = 80,
     .count = 3,
-    .timeout = 1,
+    .timeout = 5,
     .buf = {
         .size = 4096,
     },
