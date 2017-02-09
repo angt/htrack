@@ -12,6 +12,10 @@
 
 #include <arpa/inet.h>
 
+#ifndef TCP_FASTOPEN
+#define TCP_FASTOPEN 23
+#endif
+
 struct {
     struct sockaddr_storage remote, local;
     int port;
