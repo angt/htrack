@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits.h>
 
 #include <sys/socket.h>
 
@@ -12,18 +13,20 @@
 
 #include <arpa/inet.h>
 
+#include "argz/argz.h"
+
 #ifndef TCP_FASTOPEN
 #define TCP_FASTOPEN 23
 #endif
 
 struct {
     struct sockaddr_storage remote, local;
-    int port;
+    unsigned short port;
     int count;
     int timeout;
     struct {
-        char *data;
-        int size;
+        unsigned char *data;
+        size_t size;
     } req, buf;
 } ht = {
     .port = 80,
@@ -33,95 +36,6 @@ struct {
         .size = 4096,
     },
 };
-
-static int
-ht_opt_str(int argc, char **argv, void *data)
-{
-    if (argc <= 1)
-        return 1;
-
-    memcpy(data, argv + 1, sizeof(char *));
-
-    return 0;
-}
-
-static int
-ht_opt_ushort(int argc, char **argv, void *data)
-{
-    if (argc <= 1)
-        return 1;
-
-    errno = 0;
-
-    char *end = NULL;
-    long val = strtol(argv[1], &end, 0);
-    unsigned short res = val;
-
-    if (errno || argv[1] == end || val != (long)res)
-        return 1;
-
-    memcpy(data, &res, sizeof(res));
-
-    return 0;
-}
-
-static int
-ht_opt_nat(int argc, char **argv, void *data)
-{
-    if (argc <= 1)
-        return 1;
-
-    errno = 0;
-
-    char *end = NULL;
-    long val = strtol(argv[1], &end, 0);
-    int res = val;
-
-    if (errno || argv[1] == end || val < 0 || val != (long)res)
-        return 1;
-
-    memcpy(data, &res, sizeof(res));
-
-    return 0;
-}
-
-static int
-ht_opt_addr(int argc, char **argv, void *data)
-{
-    if (argc <= 1)
-        return 1;
-
-    struct sockaddr_storage addr;
-    struct sockaddr_in *sin = (struct sockaddr_in *)&addr;
-    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&addr;
-
-    memcpy(&addr, data, sizeof(addr));
-
-    if (inet_pton(AF_INET, argv[1], &sin->sin_addr) == 1) {
-        sin->sin_family = AF_INET,
-        memcpy(data, &addr, sizeof(addr));
-        return 0;
-    }
-
-    if (inet_pton(AF_INET6, argv[1], &sin6->sin6_addr) == 1) {
-        sin6->sin6_family = AF_INET6,
-        memcpy(data, &addr, sizeof(addr));
-        return 0;
-    }
-
-    return -1;
-}
-
-static int
-ht_opt(int argc, char **argv, char *name,
-       int (*f)(int, char **, void *), void *data)
-{
-    for (int i = 0; i < argc; i++)
-        if (!strcmp(argv[i], name))
-            return f(argc - i, argv + i, data);
-
-    return 0;
-}
 
 static int
 ht_sso(int fd, int level, int option, int val)
@@ -156,45 +70,60 @@ ht_fastopen(int fd)
     return 0;
 }
 
+static void
+ht_setup_port(struct sockaddr_storage *ss, uint16_t port)
+{
+    switch (ss->ss_family) {
+    case AF_INET:
+        ((struct sockaddr_in *)ss)->sin_port = htons(port);
+        break;
+    case AF_INET6:
+        ((struct sockaddr_in6 *)ss)->sin6_port = htons(port);
+        break;
+    }
+}
+
 static int
 ht_init(int argc, char **argv)
 {
-    struct {
-        char *name;
-        int (*f)(int, char **, void *);
-        void *data;
-    } opts[] = {
-        {"host", ht_opt_addr, &ht.remote},
-        {"port", ht_opt_ushort, &ht.port},
-        {"bind", ht_opt_addr, &ht.local},
-        {"send", ht_opt_str, &ht.req.data},
-        {"timeout", ht_opt_nat, &ht.timeout},
-        {"count", ht_opt_nat, &ht.count},
-        {"bufsize", ht_opt_nat, &ht.buf.size},
+    unsigned count = ht.count;
+    unsigned timeout = 1000U * ht.timeout;
+
+    struct argz htz[] = {
+        {NULL, "IPADDR", &ht.remote, argz_addr},
+        {NULL, "PORT", &ht.port, argz_ushort},
+        {"bind", "IPADDR", &ht.local, argz_addr},
+        {"send", "TEXT", &ht.req.data, argz_str},
+        {"timeout", "SECONDS", &timeout, argz_time},
+        {"count", "COUNT", &count, argz_ulong},
+        {"bufsize", "BYTES", &ht.buf.size, argz_bytes},
+        {NULL},
     };
 
-    for (int i = 0; i < sizeof(opts) / sizeof(opts[0]); i++) {
-        if (ht_opt(argc, argv, opts[i].name, opts[i].f, opts[i].data)) {
-            fprintf(stderr, "bad value for option `%s'\n", opts[i].name);
-            return 1;
-        }
-    }
+    if (argz(htz, argc, argv))
+        return 1;
 
-    in_port_t port = htons(ht.port);
-
-    switch (ht.remote.ss_family) {
-    case AF_INET:
-        memcpy(&((struct sockaddr_in *)&ht.remote)->sin_port,
-               &port, sizeof(port));
-        break;
-    case AF_INET6:
-        memcpy(&((struct sockaddr_in6 *)&ht.remote)->sin6_port,
-               &port, sizeof(port));
-        break;
-    default:
+    if (!ht.remote.ss_family) {
         fprintf(stderr, "option `host' is mandatory\n");
         return 1;
     }
+
+    if (count > INT_MAX) {
+        fprintf(stderr, "option `count' is too big\n");
+        return 1;
+    }
+
+    timeout /= 1000U;
+
+    if (timeout > INT_MAX) {
+        fprintf(stderr, "option `timeout' is too big\n");
+        return 1;
+    }
+
+    ht.count = (int)count;
+    ht.timeout = (int)timeout;
+
+    ht_setup_port(&ht.remote, ht.port);
 
     if (ht.local.ss_family &&
         ht.local.ss_family != ht.remote.ss_family) {
@@ -210,20 +139,20 @@ ht_init(int argc, char **argv)
     }
 
     if (ht.req.data)
-        ht.req.size = strlen(ht.req.data);
+        ht.req.size = strlen((const char *)ht.req.data);
 
     return 0;
 }
 
 static int
-ht_send(int fd, char *data, int size)
+ht_send(int fd, unsigned char *data, size_t size)
 {
-    int sent = 0;
+    size_t sent = 0;
 
     while (sent < size) {
-        int r = send(fd, data + sent, size - sent, 0);
+        ssize_t r = send(fd, data + sent, size - sent, 0);
 
-        if (r == -1) {
+        if (r == (ssize_t)-1) {
             if (errno == EAGAIN)
                 continue;
 
@@ -322,9 +251,9 @@ ht_wait(int fd)
         }
 
         if (pollfd.revents & POLLIN) {
-            int r = read(fd, ht.buf.data, ht.buf.size);
+            ssize_t r = read(fd, ht.buf.data, ht.buf.size);
 
-            if (r == -1) {
+            if (r == (ssize_t)-1) {
                 perror("read");
                 return 1;
             }

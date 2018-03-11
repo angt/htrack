@@ -1,0 +1,3 @@
+[submodule "argz"]
+	path = argz
+	url = https://github.com/angt/argz
